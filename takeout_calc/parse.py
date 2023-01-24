@@ -1,15 +1,13 @@
 #!/usr/bin/env python
 
+import datetime
 import decimal
 import email.message
 import mailbox
-import datetime
-from re import Match
-from typing import AnyStr
+import quopri
 
 import bs4
 import regex as re
-import quopri
 
 
 def get_html_text(html, parser: str = "html5lib"):
@@ -74,6 +72,69 @@ class AbstractEmail:
         else:
             msg_text = None
         return content_type, encoding, msg_text
+
+
+class DoorDashReceipt:
+    provider: str = "DoorDash"
+
+    regex_total = re.compile(pattern=r"^Total Charged \p{Sc}(\d+\.\d+)\b")
+    regex_order_id = re.compile(
+        pattern=r"<(https\:\/\/www\.doordash\.com\/orders\/(\w{8}\-\w{4}\-\w{4}\-\w{4}\-\w{12}))\/>")
+    regex_restaurant_name = re.compile(pattern=r"Paid with ([\w ])+\n(\w+|\s+)+ \nTotal\: \p{Sc}(\d+\.\d+)\b",
+                                       flags=re.MULTILINE | re.DEBUG | re.VERBOSE)
+
+    # Email metadata
+    email_data = None
+    multipart_messages: list = None
+    date_time = datetime.datetime(year=1970, month=1, day=1)
+    body: email.message.Message = None
+    body_as_str: str = None
+    line_seperator: str = "\n"
+
+    # Business metadata
+    order_id: str = "Unknown"
+    url: str = "Unknown"
+    amount: decimal.Decimal = decimal.Decimal(value=0)
+    restaurant: str = "Unknown"
+
+    def __init__(self, email: AbstractEmail):
+        """
+        We can either read a plaintext body or parse the full HTML body. Here,
+        we'll read the plaintext as it is easier.
+
+        :param email: The Deliveroo email receipt
+        """
+        # TODO(MinuraIddamalgoda): Parse datetime stamp
+        self.multipart_messages = email.multipart_messages
+
+        for message in self.multipart_messages:
+            content_type: str = message['Content-Type']
+            encoding: str = message['Content-Transfer-Encoding']
+
+            if content_type.startswith('text/plain'):
+                self.email_data = message
+                self.body = message
+
+                if encoding.startswith("quoted-printable"):
+                    self.body_as_str = quopri.decodestring(message.as_string()).decode(encoding='utf-8')
+                else:
+                    self.body_as_str = str(message)
+
+    def parse(self):
+        for line in self.body_as_str.split(sep=self.line_seperator):
+            self.parse_amount(line)
+            self.parse_order_id(line)
+
+    def parse_amount(self, line: str):
+        search = self.regex_total.findall(string=line)
+        if len(search) > 0:
+            self.amount += decimal.Decimal(search[0])
+
+    def parse_order_id(self, line: str):
+        search = self.regex_order_id.findall(string=line)
+        if len(search) > 0:
+            self.url = search[0][0]
+            self.order_id = search[0][1]
 
 
 class DeliverooReceipt:
@@ -183,34 +244,38 @@ class UberReceipt:
         print("TODO(MinuraIddamalgoda): Parse restaurant")
 
 
-mbox_obj = mailbox.mbox('/Users/iddamalm/code/takeout-calc/receipts/Receipts-Takeout-Uber.mbox')
+def parse(mbox_file: mailbox.mbox):
+    num_entries = len(mbox_file)
+    total = decimal.Decimal(value=0)
 
-num_entries = len(mbox_obj)
-total = decimal.Decimal(value=0)
+    for index, email_obj in enumerate(mbox_file):
+        email_data = AbstractEmail(email_obj)
 
-for idx, email_obj in enumerate(mbox_obj):
-    email_data = AbstractEmail(email_obj)
+        receipt = None
+        if email_data.sender.__contains__("uber"):
+            receipt = UberReceipt(email_data)
+        elif email_data.sender.__contains__("doordash"):
+            receipt = DoorDashReceipt(email_data)
+        elif email_data.sender.__contains__("deliveroo"):
+            receipt = DeliverooReceipt(email_data)
+        else:
+            print("Unknown delivery service found")
 
-    receipt = None
-    if email_data.sender.__contains__("uber"):
-        receipt = UberReceipt(email_data)
-    elif email_data.sender.__contains__("doordash"):
-        print("DoorDash has not been implemented yet")
-        pass
-    elif email_data.sender.__contains__("deliveroo"):
-        receipt = DeliverooReceipt(email_data)
-    else:
-        print("Unknown delivery service found")
+        if receipt is None:
+            continue
 
-    if receipt is None:
-        continue
+        receipt.parse()
 
-    receipt.parse()
+        amount = receipt.amount
+        total += amount
 
-    amount = receipt.amount
-    total += amount
+        print("Parsing {} of {}".format(index, num_entries))
+        print("Adding {} to total {} from {} ({})\n\n".format(amount, total, receipt.restaurant, receipt.order_id))
 
-    print("Parsing {} of {}".format(idx, num_entries))
-    print("Adding {} to total {} from {} ({})\n\n".format(amount, total, receipt.restaurant, receipt.order_id))
+    print("Sum:\t{}".format(total))
 
-print("Sum:\t{}".format(total))
+
+if __name__ == '__main__':
+
+    in_file = '/Users/iddamalm/code/takeout-calc/receipts/Receipts-Takeout-Uber.mbox'
+    parse(mailbox.mbox(in_file))
