@@ -3,8 +3,10 @@
 import datetime
 import decimal
 import email.message
+import html
 import mailbox
 import quopri
+from pathlib import Path
 
 import bs4
 import regex as re
@@ -81,7 +83,7 @@ class DoorDashReceipt:
     regex_order_id = re.compile(
         pattern=r"<(https\:\/\/www\.doordash\.com\/orders\/(\w{8}\-\w{4}\-\w{4}\-\w{4}\-\w{12}))\/>")
     regex_restaurant_name = re.compile(pattern=r"Paid with ([\w ])+\n(\w+|\s+)+ \nTotal\: \p{Sc}(\d+\.\d+)\b",
-                                       flags=re.MULTILINE | re.DEBUG | re.VERBOSE)
+                                       flags=re.MULTILINE)
 
     # Email metadata
     email_data = None
@@ -94,7 +96,7 @@ class DoorDashReceipt:
     # Business metadata
     order_id: str = "Unknown"
     url: str = "Unknown"
-    amount: decimal.Decimal = decimal.Decimal(value=0)
+    cost_total: decimal.Decimal = decimal.Decimal(value=0)
     restaurant: str = "Unknown"
 
     def __init__(self, email: AbstractEmail):
@@ -128,7 +130,7 @@ class DoorDashReceipt:
     def parse_amount(self, line: str):
         search = self.regex_total.findall(string=line)
         if len(search) > 0:
-            self.amount += decimal.Decimal(search[0])
+            self.cost_total += decimal.Decimal(search[0])
 
     def parse_order_id(self, line: str):
         search = self.regex_order_id.findall(string=line)
@@ -154,7 +156,7 @@ class DeliverooReceipt:
 
     # Business metadata
     order_id: str = "Unknown"
-    amount: decimal.Decimal = decimal.Decimal(value=0)
+    cost_total: decimal.Decimal = decimal.Decimal(value=0)
     restaurant: str = "Unknown"
 
     def __init__(self, email: AbstractEmail):
@@ -193,7 +195,7 @@ class DeliverooReceipt:
     def parse_amount(self, line: str):
         search = self.regex_total.findall(string=line)
         if len(search) > 0:
-            self.amount += decimal.Decimal(search[0])
+            self.cost_total += decimal.Decimal(search[0])
 
     def parse_restaurant(self, line: str):
         search = self.regex_restaurant_name.findall(string=line)
@@ -209,42 +211,59 @@ class DeliverooReceipt:
 class UberReceipt:
     provider: str = "Uber Eats"
 
-    regex_total = re.compile(r'\p{Sc}(\d+\.\d+)\b')
+    re_ascii_chars = re.compile(pattern=r'[^\x00-\x7F]+')
+    re_currency_sign = re.compile(pattern=r"\p{Sc}(\d+\.\d+)\b")
+    re_restaurant_name = re.compile(pattern=r"^\s+You ordered from (.*+)[\r\n|\r|\n]", flags=re.MULTILINE)
 
     # Email metadata
+    soup: bs4.BeautifulSoup = None
     email_data = None
     # Uber receipts do not use multipart messages
     date_time = datetime.datetime(year=1970, month=1, day=1)
     body = None
+    body_as_str: str = None
 
     # Business metadata
     order_id: str = "Unknown"
-    amount = decimal.Decimal(value=0)
+    cost_total = decimal.Decimal(value=0)
     restaurant: str = "Unknown"
 
     def __init__(self, email: AbstractEmail):
         self.email_data = email.email_data
         # TODO(MinuraIddamalgoda): Parse datetime stamp
         self.body = email.body[0][2]
+        self.soup = bs4.BeautifulSoup(self.body, "html5lib")
+        self.body_as_str = self.body
+
+        transfer_encoding: str = self.email_data['Content-Transfer-Encoding']
+        text_encoding = 'utf_8'
+        if transfer_encoding.startswith("quoted-printable"):
+            if not self.body.isascii():
+                ascii_stripped_body = self.re_ascii_chars.sub(repl='', string=self.body).encode(text_encoding)
+                self.body_as_str = quopri.decodestring(ascii_stripped_body).decode(text_encoding)
 
     def parse(self):
         self.parse_amount()
         self.parse_restaurant()
 
     def parse_amount(self):
-        amounts_found = self.regex_total.findall(string=self.body)
+        # Find any table data cells with a currency symbol
+        amounts_found = self.soup.find_all(name='td', text=self.re_currency_sign)
 
         if len(amounts_found) < 1:
             print("Unable to find total amount in email")
 
-        self.amount += decimal.Decimal(amounts_found[0])
+        # Pull the numerical amounts from the <td> cell; removing any whitespace, irrelevant text, and currency symbols
+        total = self.re_currency_sign.search(string=amounts_found[0].contents[0]).group(1)
+        self.cost_total += decimal.Decimal(total)
 
     def parse_restaurant(self):
-        self.restaurant = "Unknown"
-        print("TODO(MinuraIddamalgoda): Parse restaurant")
+        search = self.re_restaurant_name.findall(string=self.body_as_str)
+        if len(search) > 0:
+            self.restaurant = html.unescape(search[0].rstrip())
 
 
-def parse(mbox_file: mailbox.mbox):
+def parse(mbox_file: mailbox.mbox, results: list[decimal.Decimal]):
     num_entries = len(mbox_file)
     total = decimal.Decimal(value=0)
 
@@ -266,16 +285,28 @@ def parse(mbox_file: mailbox.mbox):
 
         receipt.parse()
 
-        amount = receipt.amount
+        amount = receipt.cost_total
         total += amount
 
         print("Parsing {} of {}".format(index, num_entries))
         print("Adding {} to total {} from {} ({})\n\n".format(amount, total, receipt.restaurant, receipt.order_id))
 
-    print("Sum:\t{}".format(total))
+    results.append(total)
 
 
 if __name__ == '__main__':
+    base_dir: str = "/Users/iddamalm/code/takeout-calc/"
+    default_receipt_folder: str = 'receipts/'
+    receipts_dir = base_dir + default_receipt_folder
 
-    in_file = '/Users/iddamalm/code/takeout-calc/receipts/Receipts-Takeout-Uber.mbox'
-    parse(mailbox.mbox(in_file))
+    cost_total: list[decimal.Decimal] = []
+
+    for file in Path(receipts_dir).iterdir():
+        if file.is_file():
+            if file.suffix.__eq__('.mbox'):
+                parse(mailbox.mbox(file.absolute().resolve()), cost_total)
+
+    print(sum(cost_total))
+
+    # in_file = '/Users/iddamalm/code/takeout-calc/receipts/Receipts-Takeout-Uber.mbox'
+    # parse(mailbox.mbox(in_file))
